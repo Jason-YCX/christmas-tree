@@ -1278,7 +1278,7 @@
             </tr>
             <tr>
               <td>食指指向</td>
-              <td>用糖杖的弯钩尖指向照片</td>
+              <td>指中照片，树会停转</td>
             </tr>
             <tr>
               <td>先指稳，再捏合</td>
@@ -6224,6 +6224,7 @@
         runtimeRoot = null,
         onAction,
         onCursor,
+        pickPhoto,
         onProximity,
         onStatus,
         onEnabled,
@@ -6384,6 +6385,8 @@
         let handCount = 0, pendingCount = 0, countSince = 0, sampleAt = 0;
         let cursor = null, aimAt = 0, previousPalm = null, palmAt = 0, palmSpeed = 0;
         let pinchTarget = null, pinchArmedUntil = -Infinity;
+        // 锁照片本身。坐标只用来画糖杖；拇指靠拢时，指尖可能已移到相邻照片。
+        let photoAim = null, nextPhoto = null, nextPhotoSince = 0;
         let dualMode = '', dualTrail = [], snowBottom = null, snowAfter = 0;
         const lastAction = new Map();
         function status(s) {
@@ -6397,7 +6400,30 @@
           lastAction.set(name, now);
           statusUntil = now + 420;
           status(words[name] || '手势已识别');
-          onAction(name);
+          onAction(name, name === 'pinch' ? pinchTarget?.photoIndex : undefined);
+        }
+        function releasePhotoAim() {
+          nextPhoto = null;
+          if (!photoAim) return;
+          photoAim = pinchTarget = null;
+          pinchArmedUntil = -Infinity;
+          cursor = null;
+          onCursor(null, null);
+        }
+        function aimPhoto(point, span, now) {
+          const index = pickPhoto?.(point.x, point.y) ?? -1;
+          if (photoAim && index !== photoAim.index) {
+            // 短暂扫过空白或另一张照片仍保留高亮。持续伸指指向新目标才切换。
+            if (nextPhoto !== index) { nextPhoto = index; nextPhotoSince = now; }
+            if (now - nextPhotoSince < (index < 0 ? 420 : 280)) return;
+            releasePhotoAim();
+          }
+          nextPhoto = null;
+          if (index < 0) return;
+          if (!photoAim) photoAim = { index, openSpan: span };
+          photoAim.point = { ...point, photoIndex: index };
+          photoAim.openSpan = Math.max(span, photoAim.openSpan * .995);
+          photoAim.lastIntentAt = now;
         }
         function clearCandidate() {
           if (candidate) onProgress?.(0);
@@ -6406,6 +6432,7 @@
           consecutive = false;
         }
         function clearMotion() {
+          releasePhotoAim();
           trace = [];
           pinchTarget = null;
           pinchArmedUntil = -Infinity;
@@ -6938,9 +6965,18 @@
           }
           // 先用伸出的食指瞄准，再把拇指合上。握拳、张掌或比 V 会直接结束这次瞄准。
           const distinctPose = shape.pose === 'fist' || shape.pose === 'palm' || shape.pose === 'peace';
-          if (distinctPose || (now > pinchArmedUntil && heldPose !== 'pinch')) pinchTarget = null;
+          const closingPhoto = !distinctPose && photoAim && pinchTarget?.photoIndex === photoAim.index
+            && shape.tipRatio < Math.max(.48, photoAim.openSpan * .78);
+          if (closingPhoto && shape.pinchPossible) {
+            // 慢慢合指也能确认，只有失去指向和合指证据后才开始计算宽限时间。
+            photoAim.lastIntentAt = now;
+            pinchArmedUntil = now + 1400;
+          }
+          if (photoAim && now - photoAim.lastIntentAt > (distinctPose ? 200 : 1400)) releasePhotoAim();
+          if ((!photoAim && distinctPose) || (now > pinchArmedUntil && heldPose !== 'pinch')) pinchTarget = null;
           const closingThreshold = shape.pointReachable && heldPose !== 'pinch' ? .32 : .40;
-          const closingOnTarget = !distinctPose && pinchTarget && shape.pinchPossible && shape.tipRatio < closingThreshold;
+          const closingOnTarget = !distinctPose && pinchTarget &&
+            (closingPhoto || (shape.pinchPossible && shape.tipRatio < closingThreshold));
           const openPoint = !closingOnTarget && shape.pointReachable;
           const trackingPoint = openPoint || (!closingOnTarget && !distinctPose && cursor &&
             now - aimAt <= 145 && shape.pointHoldable);
@@ -6956,11 +6992,13 @@
           previousPalm = center;
           palmAt = now;
           onProximity?.(center);
-          if (trackingPoint || closingOnTarget) {
-            // 捏合会自然带偏指尖，确认时沿用刚才指中的位置。
-            cursor = trackingPoint ? { x: 1 - hand[8].x, y: hand[8].y } : pinchTarget;
+          if (trackingPoint || closingOnTarget || photoAim) {
+            const tip = { x: 1 - hand[8].x, y: hand[8].y };
+            if (openPoint) aimPhoto(tip, shape.tipRatio, now);
+            else nextPhoto = null;
+            cursor = trackingPoint ? tip : photoAim?.point ?? pinchTarget;
             aimAt = now;
-            onCursor(cursor.x, cursor.y);
+            onCursor(cursor.x, cursor.y, photoAim?.index);
           } else if (cursor && (distinctPose || now - aimAt >= 145)) {
             cursor = null;
             onCursor(null, null);
@@ -6974,10 +7012,10 @@
             lastTurn = 0;
           }
           if (name !== 'palm' && finishHorizontal(now)) afterSwipe = now + 185;
-          latch(name, now, now >= afterSwipe && palmSpeed < .56);
+          latch(name, now, now >= afterSwipe && (palmSpeed < .56 || (pinching && photoAim)));
           if (trackingPoint && shape.tipRatio >= .36 && heldPose === 'point' && (openPoint || pinchTarget)) {
-            pinchTarget = cursor;
-            pinchArmedUntil = now + 520;
+            pinchTarget = photoAim?.point ?? cursor;
+            pinchArmedUntil = now + (photoAim ? 1400 : 520);
           } else if (heldPose === 'pinch') {
             // 手保持捏合只执行一次，下一次选择需要重新指向。
             pinchArmedUntil = -Infinity;
@@ -7295,6 +7333,7 @@
         }
         return {
           start,
+          releasePhotoAim,
           labels: words,
           retryCamera() {
             if (!retryAvailable || document.hidden) return;
@@ -9230,7 +9269,7 @@
       const stateCopy = {
         BOOK: { action: '翻开书', hint: '点书或张掌左挥' },
         TREE: { action: '展开相册', hint: '拖动转树，张掌停住挂照片' },
-        PHOTOS: { action: '收起相册', hint: '轻点照片，或先指稳再捏合' },
+        PHOTOS: { action: '收起相册', hint: '指中停转，捏合放大' },
         FOCUS: { hint: '左右切换，点留白写说明' },
       };
       let world = null,
@@ -9418,6 +9457,7 @@
 
       // ── 状态机：开书、收束、挂片和聚焦共用可逆时间轴，过渡锁统一处理输入 ──
       function animate(duration, step, finish, kind = '') {
+        gestures?.releasePhotoAim();
         transition = { start: t, duration, step, finish, kind };
         refresh();
       }
@@ -9500,8 +9540,7 @@
       function focusPhoto(i) {
         if (!canUse() || fsm !== 'PHOTOS' || i < 0) return;
         world.album.select(i);
-        velocity = 0;
-        spin = null;
+        holdTreeRotation();
         focusZoom = focusZoomGoal = 1;
         audioSystem.play('photo');
         closeWelcome();
@@ -9516,6 +9555,7 @@
             focus = 1;
             fsm = 'FOCUS';
           },
+          'photo-focus',
         );
       }
       function putBack(after) {
@@ -9575,9 +9615,22 @@
         else if (fsm === 'TREE') photoTransition(true);
         else if (fsm === 'PHOTOS') photoTransition(false);
       }
-      function fastTurn(dir) {
-        pendingDragAngle = 0;
+      function holdTreeRotation() {
+        spin = null;
         velocity = 0;
+        pendingDragAngle = 0;
+        releaseStamp = null;
+        // 解锁后从当前朝向重新加速，保留拖动松手原有的三秒等待。
+        autoAfter = Math.max(autoAfter, t);
+      }
+      function leavePhotoForRotation() {
+        if (fsm !== 'PHOTOS') return;
+        gestures?.releasePhotoAim();
+        setHover(null);
+      }
+      function fastTurn(dir) {
+        leavePhotoForRotation();
+        holdTreeRotation();
         spin = { start: t, from: yaw, delta: dir * 1.12 };
         autoAfter = t + 2;
       }
@@ -9624,12 +9677,13 @@
         if (name === 'palm' && fsm === 'TREE') photoTransition(true);
         else if (name === 'fist') back();
         else if (name === 'pinch') {
-          const p = handAim || pointing;
-          const h = p ? world.hit(p.x, p.y) : null;
           if (fsm === 'BOOK') goOpen();
           else if (fsm === 'FOCUS') putBack();
-          else if (fsm === 'PHOTOS' && h?.index >= 0) focusPhoto(h.index);
-          else if (fsm === 'TREE' && h?.star) effect('light', true);
+          else if (fsm === 'PHOTOS' && Number.isInteger(value) && value >= 0 && value < world.album.count) focusPhoto(value);
+          else if (fsm === 'TREE') {
+            const p = handAim || pointing;
+            if (p && world.hit(p.x, p.y).star) effect('light', true);
+          }
         } else if (tree) {
           const fx = { up: 'light', peace: 'firework', heart: 'heart', snow: 'snow', scatter: 'scatter' }[
             name
@@ -9653,6 +9707,7 @@
       async function changePhotos(files, clear = false) {
         if (!canUse()) return;
         closeWelcome();
+        gestures?.releasePhotoAim();
         albumBusy = true;
         refresh();
         try {
@@ -9710,9 +9765,10 @@
           stage.classList.remove('hot');
           return;
         }
-        const h = world.hit(pos.x, pos.y);
+        const h = pos === handAim && fsm === 'PHOTOS' ? { index: pos.photoIndex ?? -1 } : world.hit(pos.x, pos.y);
         hoverBook = fsm === 'BOOK' && h.book;
-        hoverIndex = fsm === 'PHOTOS' ? h.index : -1;
+        hoverIndex = fsm === 'PHOTOS' && !spin && !drag?.rotating && pointers.size < 2
+          ? h.index : -1;
         stage.classList.toggle(
           'hot',
           hoverBook ||
@@ -9756,6 +9812,7 @@
         const now = performance.now();
         drag.travel = Math.max(drag.travel, Math.hypot(p.x - drag.x, p.y - drag.y));
         if (drag.travel > 5 && ['TREE', 'PHOTOS'].includes(fsm)) {
+          if (!drag.rotating) leavePhotoForRotation();
           spin = null;
           velocity = 0;
           const angle = (p.x - (drag.rotating ? drag.px : drag.x)) * .0072;
@@ -9765,7 +9822,6 @@
           drag.speed = mix(drag.speed, clamp(angle / sampleTime, -4, 4), 1 - Math.exp(-24 * sampleTime));
           autoAfter = t + 3;
           stage.classList.add('grabbing');
-          hoverIndex = -1;
         }
         drag.px = p.x;
         drag.py = p.y;
@@ -9810,7 +9866,7 @@
       stage.addEventListener('pointercancel', (e) => releasePointer(e, true));
       stage.addEventListener('lostpointercapture', (e) => releasePointer(e, true));
       stage.addEventListener('pointerleave', () => {
-        if (!pointers.size) setHover(null);
+        if (!pointers.size) setHover(handAim);
       });
       stage.addEventListener(
         'wheel',
@@ -9927,6 +9983,8 @@
           runtimeRoot: webRuntime,
           isPaused: () => !!transition || albumBusy || !$('captionForm').hidden || !$('blessInput').hidden,
           onAction: (name, value) => perform(name, value, true),
+          pickPhoto: (x, y) => fsm === 'PHOTOS' && canUse() && !spin && !pointers.size
+            ? world.hit(x, y).index : -1,
           canScatter: treeEffectsAvailable,
           canSnow: treeEffectsAvailable,
           onProgress: fraction => { $('handHold').style.transform = 'scaleX(' + fraction + ')'; },
@@ -9934,14 +9992,14 @@
           onProximity: (p) => {
             nearBook = !!(p && world && fsm === 'BOOK' && world.hit(p.x, p.y).book);
           },
-          onCursor: (x, y) => {
+          onCursor: (x, y, photoIndex) => {
             cursor.hidden = x == null;
             if (x == null) {
               if (handAim && !pointers.size) setHover(null);
               handAim = null;
               return;
             }
-            handAim = { x, y };
+            handAim = { x, y, photoIndex };
             cursor.style.left = x * 100 + '%';
             cursor.style.top = y * 100 + '%';
             setHover(handAim);
@@ -9977,7 +10035,10 @@
           paletteHex = blendedPalette(weights);
           if (k >= 1) themeMotion = null;
         }
-        if (spin) {
+        const viewingPhoto = fsm === 'FOCUS' || transition?.kind === 'photo-focus';
+        if (viewingPhoto || (fsm === 'PHOTOS' && hoverIndex >= 0 && !drag?.rotating)) {
+          holdTreeRotation();
+        } else if (spin) {
           const p = clamp((t - spin.start) / 0.74);
           yaw = spin.from + spin.delta * easeInOutCubic(p);
           if (p >= 1) spin = null;
@@ -10256,6 +10317,7 @@
       document.addEventListener('visibilitychange', () => {
         audioSystem?.visibility(document.hidden);
         if (document.hidden) {
+          gestures?.releasePhotoAim();
           if (frameId) cancelAnimationFrame(frameId);
           frameId = 0;
           pointers.clear();
