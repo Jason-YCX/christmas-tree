@@ -451,6 +451,28 @@
         border-left: 0;
         border-top: 0;
       }
+      .cam-view video, .cam-mask {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+      /* 视频在视口内持续取帧，始终由完全不透明的图标层遮住。 */
+      .cam-mask {
+        z-index: 1;
+        display: grid;
+        place-items: center;
+        background: linear-gradient(130deg, #2c3b41, #172b36);
+      }
+      .camera-retry {
+        position: absolute;
+        inset: 0;
+        z-index: 3;
+        font-size: 12px;
+        background: #12232e;
+        pointer-events: auto;
+      }
       .hand-preview {
         position: absolute;
         bottom: calc(100% + 7px);
@@ -1212,13 +1234,17 @@
         </div>
       </section>
         <button id="cam" class="cam" aria-label="开启手势" aria-pressed="false">
-          <span class="cam-view" aria-hidden="true"><svg class="icon"><use href="#i-hand" /></svg></span><span
+          <span class="cam-view" aria-hidden="true">
+            <video id="handSource" muted playsinline webkit-playsinline disablepictureinpicture disableremoteplayback tabindex="-1"></video>
+            <span class="cam-mask"><svg class="icon"><use href="#i-hand" /></svg></span>
+          </span><span
             ><span class="cam-title" id="camTitle">开启手势</span
             ><span class="cam-info" id="camInfo"></span></span
           >
         </button>
-        <div class="hand-preview" id="handPreview" aria-hidden="true" hidden>
-          <canvas id="skeleton"></canvas><span id="handHold" class="hand-hold"></span>
+        <div class="hand-preview" id="handPreview" hidden>
+          <canvas id="skeleton" aria-hidden="true"></canvas><span id="handHold" class="hand-hold"></span>
+          <button type="button" id="retryCamera" class="camera-retry" hidden>重新取景</button>
         </div>
         <nav class="dock" id="effectDock" aria-label="圣诞树特效" hidden>
           <div class="effects" id="effects"></div>
@@ -6194,19 +6220,20 @@
       // ── 手势：专用工作线程处理相机帧，主线程只读取 21 个关键点和绘制预览 ──
       function createGestures({
         canvas,
+        video,
         runtimeRoot = null,
         onAction,
         onCursor,
         onProximity,
         onStatus,
         onEnabled,
+        onRetryAvailable,
         onProgress,
         canScatter = () => true,
         canSnow = () => true,
         isPaused,
       }) {
-        // 静音、内联的采集源始终不加入页面，屏幕只显示骨架。
-        const video = document.createElement('video');
+        // 取景源在页面布局内播放，骨架预览只绘制模型返回的关节。
         video.muted = true;
         video.defaultMuted = true;
         video.playsInline = true;
@@ -6342,8 +6369,8 @@
           loading = false,
           busy = false;
         let needsPlaybackTap = false, playbackAttempt = 0, playbackTimer = 0;
-        let lastVideo = -1,
-          lastSeen = 0,
+        let captureEpoch = 0, retryAvailable = false;
+        let lastSeen = 0,
           lastStatus = '',
           statusUntil = 0,
           trace = [],
@@ -6451,6 +6478,9 @@
           ink.clearRect(0, 0, canvas.width, canvas.height);
         }
         function pauseCapture() {
+          ++captureEpoch;
+          retryAvailable = false;
+          onRetryAvailable?.(false);
           clearInterval(timer);
           if (videoCallback !== null) video.cancelVideoFrameCallback(videoCallback);
           videoCallback = null;
@@ -6957,10 +6987,9 @@
           clearTimeout(deadline);
           enabled = true;
           loading = false;
-          lastVideo = -1;
           lastSeen = performance.now();
           onEnabled(true);
-          status('请把手放到镜头前');
+          status('正在读取相机画面…');
           startCapture(token);
         }
         async function startMain(token) {
@@ -7025,7 +7054,7 @@
                 const pending = latestFrame;
                 latestFrame = null;
                 if (performance.now() - pending.sampleTime < 85)
-                  capture(token, pending.sampleTime, pending.mediaTime);
+                  capture(token, pending.sampleTime);
               }
             };
             worker.postMessage({ type: 'init', sources });
@@ -7033,25 +7062,23 @@
             void startMain(token);
           }
         }
-        async function capture(token, sampleTime, mediaTime) {
+        async function capture(token, sampleTime) {
           if (
             token !== version ||
             !enabled ||
             document.hidden ||
             video.readyState < 2 ||
-            mediaTime === lastVideo ||
             sampleTime + 3 < nextSampleAt
           )
             return;
           // 推理尚未结束时只记最新帧的时间，不复制图像、不排队处理旧帧。
           if (busy) {
-            latestFrame = { sampleTime, mediaTime };
+            latestFrame = { sampleTime };
             return;
           }
           latestFrame = null;
           busy = true;
           waitingSince = performance.now();
-          lastVideo = mediaTime;
           const cadence = usingMain ? mainInterval : 1000 / 30;
           nextSampleAt = Math.max(nextSampleAt + cadence, sampleTime + cadence - 3);
           if (mainEngine) {
@@ -7098,40 +7125,97 @@
         function startCapture(token) {
           const supportsVideoFrames = typeof video.requestVideoFrameCallback === 'function'
             && typeof video.cancelVideoFrameCallback === 'function';
-          let lastCallback = performance.now();
-          let lastPoll = lastCallback, lastProgress = lastCallback, observedFrame = lastVideo, nudged = false;
+          const epoch = ++captureEpoch;
+          const current = () => token === version && captureEpoch === epoch && enabled;
+          let lastFrameAt = performance.now(), lastPoll = lastFrameAt, lastPresentationAt = lastFrameAt;
+          let presented = -1, mediaTime = -1, decoded = -1, clock = -1, binding = 0;
+          let rebound = false, recoveryStarted = 0, recoveredFrames = 0;
           nextSampleAt = 0;
-          if (supportsVideoFrames) {
-            const onFrame = (now, metadata) => {
-              if (token !== version || !enabled) return;
-              lastCallback = now;
+          function readable() {
+            return !document.hidden && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0
+              && !stream?.getVideoTracks()[0]?.muted;
+          }
+          function acceptFrame(now) {
+            lastFrameAt = now;
+            clock = video.currentTime;
+            if (retryAvailable) {
+              retryAvailable = false;
+              onRetryAvailable?.(false);
+            }
+            // 重挂偶尔只给出一帧。连续恢复后才允许下一次自动重挂。
+            if (rebound) {
+              if (++recoveredFrames === 1) recoveryStarted = now;
+              if (recoveredFrames >= 3 && now - recoveryStarted >= 350) rebound = false;
+            }
+            if (lastStatus === '正在读取相机画面…' || lastStatus === '正在恢复取景…' || lastStatus === '取景暂停') {
+              status('相机画面已就绪');
+            }
+            void capture(token, now);
+          }
+          function watchFrames() {
+            if (!supportsVideoFrames) return;
+            const id = ++binding;
+            function onFrame(now, meta) {
+              if (!current() || binding !== id) return;
               videoCallback = video.requestVideoFrameCallback(onFrame);
-              capture(token, now, metadata.mediaTime ?? video.currentTime);
-            };
+              if (!readable()) return;
+              // Safari 的直播帧可能共用同一 mediaTime，每个新呈现的帧仍须送入模型。
+              const count = meta.presentedFrames, time = meta.mediaTime;
+              const fresh = !Number.isFinite(count) || count !== presented
+                || (Number.isFinite(time) && time !== mediaTime);
+              presented = count;
+              mediaTime = time;
+              if (fresh) {
+                lastPresentationAt = now;
+                acceptFrame(now);
+              }
+            }
             videoCallback = video.requestVideoFrameCallback(onFrame);
           }
-          // 部分浏览器不会为离屏视频派发新帧事件，可见时用视频时钟补位。
+          watchFrames();
+          function offerRetry() {
+            if (!current() || retryAvailable) return;
+            retryAvailable = true;
+            status('取景暂停');
+            onRetryAvailable?.(true);
+          }
+          function restoreFeed(now) {
+            rebound = true;
+            recoveryStarted = recoveredFrames = 0;
+            lastFrameAt = now;
+            if (videoCallback !== null) video.cancelVideoFrameCallback(videoCallback);
+            videoCallback = null;
+            ++binding;
+            resetHands();
+            resetFiltering();
+            clearDrawing();
+            status('正在恢复取景…');
+            // 同一条已授权的相机轨道重新绑定到视频，保留权限和已启动的模型。
+            try {
+              video.srcObject = null;
+              video.srcObject = stream;
+              presented = mediaTime = decoded = clock = -1;
+              watchFrames();
+              video.play().catch(() => { if (current() && rebound && !recoveredFrames) offerRetry(); });
+            } catch { offerRetry(); }
+          }
           timer = setInterval(() => {
-            if (token !== version || !enabled) return;
+            if (!current()) return;
             const now = performance.now();
-            if (document.hidden || now - lastPoll > 1500 || busy || observedFrame !== lastVideo) {
-              lastProgress = now;
-              observedFrame = lastVideo;
-              nudged = false;
-            }
+            if (document.hidden || now - lastPoll > 1500) lastFrameAt = now;
             lastPoll = now;
             if (document.hidden) return;
             if (thread && busy && now - waitingSince > 4200) { void startMain(token); return; }
-            if (now - lastProgress > 8500) {
-              stop('相机已授权，但没有收到新画面。请点「开启手势」重试');
-              return;
+            // 部分版本只有视频时钟或解码计数会走。计数可用时优先采用它，避免反复推理同一帧。
+            if ((!supportsVideoFrames || now - lastPresentationAt > 220) && readable()) {
+              const count = video.getVideoPlaybackQuality?.().totalVideoFrames;
+              const fresh = Number.isFinite(count) && count > 0 ? count !== decoded : video.currentTime !== clock;
+              decoded = count;
+              if (fresh) acceptFrame(now);
             }
-            if (!nudged && now - lastProgress > 4000) {
-              nudged = true;
-              video.play().catch(() => {});
-              status('正在等待摄像头送来画面…');
-            }
-            if (!supportsVideoFrames || now - lastCallback > 220) capture(token, now, video.currentTime);
+            if (busy || now - lastFrameAt < 2500) return;
+            if (!rebound) restoreFeed(now);
+            else offerRetry();
           }, 1000 / 30);
         }
         async function start() {
@@ -7212,6 +7296,11 @@
         return {
           start,
           labels: words,
+          retryCamera() {
+            if (!retryAvailable || document.hidden) return;
+            stop();
+            return start();
+          },
           resumePlayback() {
             if (needsPlaybackTap && loading && stream && !document.hidden) {
               status('正在启动相机画面…');
@@ -9834,12 +9923,14 @@
         const treeEffectsAvailable = () => fsm === 'TREE' || fsm === 'PHOTOS';
         gestures = createGestures({
           canvas: $('skeleton'),
+          video: $('handSource'),
           runtimeRoot: webRuntime,
           isPaused: () => !!transition || albumBusy || !$('captionForm').hidden || !$('blessInput').hidden,
           onAction: (name, value) => perform(name, value, true),
           canScatter: treeEffectsAvailable,
           canSnow: treeEffectsAvailable,
           onProgress: fraction => { $('handHold').style.transform = 'scaleX(' + fraction + ')'; },
+          onRetryAvailable: show => { $('retryCamera').hidden = !show; },
           onProximity: (p) => {
             nearBook = !!(p && world && fsm === 'BOOK' && world.hit(p.x, p.y).book);
           },
@@ -9867,6 +9958,7 @@
             $('cam').setAttribute('aria-pressed', String(on));
           },
         });
+        $('retryCamera').onclick = () => gestures.retryCamera();
         $('cam').onclick = () => {
           closeWelcome();
           startGesturesWhenVisible = false;
