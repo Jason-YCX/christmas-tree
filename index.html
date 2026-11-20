@@ -1073,6 +1073,12 @@
         "imports": {
           "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
           "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+        },
+        "scopes": {
+          "./runtime/three-0.170.0/": {
+            "three": "./runtime/three-0.170.0/build/three.module.js",
+            "three/addons/": "./runtime/three-0.170.0/examples/jsm/"
+          }
         }
       }
     </script>
@@ -1168,8 +1174,8 @@
               ></button>
             </div>
           </div>
-          <button class="round" id="music" title="关闭音乐" aria-label="关闭音乐" aria-pressed="true">
-            <svg class="icon"><use href="#i-audio" /></svg></button
+          <button class="round" id="music" title="播放音乐" aria-label="播放音乐" aria-pressed="false">
+            <svg class="icon"><use href="#i-mute" /></svg></button
           ><button id="help" class="round" title="玩法指南" aria-label="玩法指南" aria-controls="guide">
             <svg class="icon"><use href="#i-help" /></svg>
           </button>
@@ -1324,6 +1330,8 @@
       }
       const compactDevice =
         matchMedia('(pointer:coarse)').matches || Math.min(screen.width, screen.height) < 690;
+      // 部署时从相册自己的地址加载；单独拷贝 HTML 时仍可使用原来的 CDN。
+      const webRuntime = ['http:', 'https:'].includes(location.protocol) ? new URL('./runtime/', document.baseURI).href : null;
       const themes = [
         {
           name: '经典红绿金',
@@ -5906,6 +5914,9 @@
           noiseBuffer,
           enabled = true,
           hidden = document.hidden,
+          previousSessionType,
+          interrupted = false,
+          playedOnce = false,
           timer = 0,
           step = 0,
           next = 0;
@@ -6045,9 +6056,26 @@
             step = (step + 1) % melody.length;
           }
         }
+        // Safari 支持时按媒体音量播放八音盒，离开页面或主动静音时归还原会话类型。
+        function playbackSession(active) {
+          try {
+            const session = navigator.audioSession;
+            if (!session) return;
+            if (active && previousSessionType === undefined && session.type !== 'playback') {
+              const original = session.type;
+              session.type = 'playback';
+              previousSessionType = original;
+            } else if (!active && previousSessionType !== undefined) {
+              if (session.type === 'playback') session.type = previousSessionType;
+              previousSessionType = undefined;
+            }
+          } catch { /* 会话类型为可选能力，音符合成仍由 AudioContext 控制。 */ }
+        }
         function syncPlayback() {
           const playing = enabled && !hidden && ctx?.state === 'running';
           if (playing && !timer) {
+            playedOnce = true;
+            playbackSession(true);
             master.gain.cancelScheduledValues(ctx.currentTime);
             master.gain.setTargetAtTime(.58, ctx.currentTime, .03);
             next = ctx.currentTime + .065;
@@ -6059,32 +6087,46 @@
             master.gain.cancelScheduledValues(ctx.currentTime);
             master.gain.setTargetAtTime(0, ctx.currentTime, .03);
           }
+          if (!enabled || hidden) playbackSession(false);
           onChange?.(enabled, playing);
         }
-        function start(forceResume = false) {
+        function stateChanged() {
+          const interruptionEnded = interrupted && ctx.state === 'suspended';
+          interrupted = ctx.state === 'interrupted';
+          syncPlayback();
+          if (interruptionEnded && enabled && !hidden) start();
+        }
+        function start(userInput = false) {
           if (!enabled || hidden) {
             syncPlayback();
             return;
           }
           if (!ctx) {
             try {
-              if (init()) ctx.onstatechange = syncPlayback;
+              if (init()) ctx.onstatechange = stateChanged;
               else enabled = false;
             } catch {
               ctx?.close().catch(() => {});
               ctx = null;
-              enabled = false;
             }
           }
-          if (ctx && (forceResume || ctx.state !== 'running')) {
-            ctx.resume().then(syncPlayback, syncPlayback);
+          // 初次启动被拦截时，等点击再同步 resume，避免预先排队的请求吞掉音乐按钮的第一次点击。
+          if (ctx && ctx.state !== 'running' && (userInput || playedOnce)) {
+            if (userInput) playbackSession(true);
+            try {
+              ctx.resume().then(syncPlayback, syncPlayback);
+            } catch { syncPlayback(); }
           }
           syncPlayback();
         }
         function toggle() {
-          enabled = !enabled;
-          if (enabled) start();
-          else syncPlayback();
+          if (timer && ctx?.state === 'running') {
+            enabled = false;
+            syncPlayback();
+          } else {
+            enabled = true;
+            start(true);
+          }
           return enabled;
         }
         function play(name) {
@@ -6121,15 +6163,19 @@
           hidden = isHidden || document.hidden;
           if (hidden) {
             syncPlayback();
-            if (ctx?.state === 'running') ctx.suspend().catch(() => {});
-          } else if (enabled) start(true);
+            if (ctx?.state === 'running') {
+              ctx.suspend().then(() => {
+                if (enabled && !hidden && ctx.state === 'suspended') start();
+              }, syncPlayback);
+            }
+          } else if (enabled) start();
         }
         // 允许自动播放时立即响起；受限时在真实用户输入的调用栈内再次请求播放。
         function unlock(event) {
           if (!event.isTrusted || event.repeat || event.target?.closest?.('#music')) return;
-          if (enabled && !hidden && ctx?.state !== 'running') start();
+          if (enabled && !hidden && ctx?.state !== 'running') start(true);
         }
-        for (const type of ['click', 'keydown', 'pointerup'])
+        for (const type of ['touchend', 'pointerup', 'click', 'keydown'])
           document.addEventListener(type, unlock, true);
         start();
         return {
@@ -6139,12 +6185,16 @@
           get enabled() {
             return enabled;
           },
+          get playing() {
+            return Boolean(timer);
+          },
         };
       }
 
       // ── 手势：专用工作线程处理相机帧，主线程只读取 21 个关键点和绘制预览 ──
       function createGestures({
         canvas,
+        runtimeRoot = null,
         onAction,
         onCursor,
         onProximity,
@@ -6162,25 +6212,36 @@
         video.playsInline = true;
         video.disablePictureInPicture = true;
         video.disableRemotePlayback = true;
-        const packageRoot = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
-        const modelURL =
-          'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+        const sources = [];
+        if (runtimeRoot) {
+          const pkg = runtimeRoot + 'vision-0.10.14';
+          sources.push({ pkg, modelURL: pkg + '/hand_landmarker.task' });
+        }
+        sources.push({
+          pkg: 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14',
+          modelURL: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        });
         // 同一套模型可在工作线程或页面运行。后者直接读取 video，用普通画布接收纹理。
-        async function loadHandEngine(pkg, modelURL, makeCanvas, current = () => true, signal) {
+        async function loadHandEngine(sources, makeCanvas, current = () => true, signal) {
           let HandLandmarker, files, model;
-          try {
-            const [vision, bytes] = await Promise.all([
-              import(pkg + '/vision_bundle.mjs'),
-              fetch(modelURL, { signal }).then(response => {
-                if (!response.ok) throw new Error('model');
-                return response.arrayBuffer();
-              }),
-            ]);
-            HandLandmarker = vision.HandLandmarker;
-            model = new Uint8Array(bytes);
-            files = await vision.FilesetResolver.forVisionTasks(pkg + '/wasm');
-          } catch (cause) {
-            throw Object.assign(new Error('手势组件或模型下载失败'), { cause, assetFailure: true });
+          for (let i = 0; i < sources.length; i++) {
+            const { pkg, modelURL } = sources[i];
+            try {
+              const [vision, bytes] = await Promise.all([
+                import(pkg + '/vision_bundle.mjs'),
+                fetch(modelURL, { signal }).then(response => {
+                  if (!response.ok) throw new Error('model');
+                  return response.arrayBuffer();
+                }),
+              ]);
+              HandLandmarker = vision.HandLandmarker;
+              model = new Uint8Array(bytes);
+              files = await vision.FilesetResolver.forVisionTasks(pkg + '/wasm');
+              break;
+            } catch (cause) {
+              if (!current() || signal?.aborted || i === sources.length - 1)
+                throw Object.assign(new Error('手势组件或模型下载失败'), { cause, assetFailure: true });
+            }
           }
           let detector = null, delegate = 'GPU';
           async function open(backend) {
@@ -6228,7 +6289,7 @@
           self.onmessage = async ({ data }) => {
             try {
               if (data.type === 'init') {
-                engine = await loadHandEngine(data.pkg, data.model, () => new OffscreenCanvas(2, 2));
+                engine = await loadHandEngine(data.sources, () => new OffscreenCanvas(2, 2));
                 self.postMessage({ type: 'ready' });
               } else if (data.type === 'frame') {
                 try {
@@ -6921,7 +6982,7 @@
           }, 60000);
           modelAbort = typeof AbortController === 'function' ? new AbortController() : null;
           try {
-            const engine = await loadHandEngine(packageRoot, modelURL, () => {
+            const engine = await loadHandEngine(sources, () => {
               const surface = document.createElement('canvas');
               surface.width = surface.height = 2;
               return surface;
@@ -6967,7 +7028,7 @@
                   capture(token, pending.sampleTime, pending.mediaTime);
               }
             };
-            worker.postMessage({ type: 'init', pkg: packageRoot, model: modelURL });
+            worker.postMessage({ type: 'init', sources });
           } catch {
             void startMain(token);
           }
@@ -9255,14 +9316,15 @@
       };
       function updateMusicButton(on, playing) {
         const b = $('music');
-        b.setAttribute('aria-pressed', String(on));
-        b.setAttribute('aria-label', on ? '关闭音乐' : '开启音乐');
-        b.title = on && !playing ? '关闭音乐（等待首次操作以播放）' : b.getAttribute('aria-label');
-        b.innerHTML = icon(on ? 'audio' : 'mute');
+        const label = playing ? '关闭音乐' : on ? '播放音乐' : '开启音乐';
+        b.setAttribute('aria-pressed', String(playing));
+        b.setAttribute('aria-label', label);
+        b.title = label;
+        b.innerHTML = icon(playing ? 'audio' : 'mute');
       }
       $('music').onclick = () => {
         const on = audioSystem.toggle();
-        feedback(on ? '八音盒已开启' : '音乐已关闭');
+        feedback(on ? (audioSystem.playing ? '八音盒已开启' : '正在启动八音盒') : '音乐已关闭');
       };
 
       // ── 状态机：开书、收束、挂片和聚焦共用可逆时间轴，过渡锁统一处理输入 ──
@@ -9772,6 +9834,7 @@
         const treeEffectsAvailable = () => fsm === 'TREE' || fsm === 'PHOTOS';
         gestures = createGestures({
           canvas: $('skeleton'),
+          runtimeRoot: webRuntime,
           isPaused: () => !!transition || albumBusy || !$('captionForm').hidden || !$('blessInput').hidden,
           onAction: (name, value) => perform(name, value, true),
           canScatter: treeEffectsAvailable,
@@ -10012,20 +10075,26 @@
           wake();
         });
       }
+      async function loadSceneModules() {
+        const passes = ['EffectComposer', 'RenderPass', 'UnrealBloomPass', 'OutputPass', 'ShaderPass'];
+        if (webRuntime) {
+          const root = webRuntime + 'three-0.170.0/';
+          try {
+            return await Promise.all([
+              import(root + 'build/three.module.js'),
+              ...passes.map(name => import(root + 'examples/jsm/postprocessing/' + name + '.js')),
+            ]);
+          } catch { /* 单文件静态部署没有随站资源时使用 importmap 的 CDN 地址。 */ }
+        }
+        return Promise.all([import('three'), ...passes.map(name => import('three/addons/postprocessing/' + name + '.js'))]);
+      }
       async function boot() {
-        const modules = Promise.all([
-          import('three'),
-          import('three/addons/postprocessing/EffectComposer.js'),
-          import('three/addons/postprocessing/RenderPass.js'),
-          import('three/addons/postprocessing/UnrealBloomPass.js'),
-          import('three/addons/postprocessing/OutputPass.js'),
-          import('three/addons/postprocessing/ShaderPass.js'),
-        ]);
-        // 在等待 CDN 时也立即展示书；离线时，后续操作沿用同一状态机。
+        const modules = loadSceneModules();
+        // 在组件下载时也立即展示书；离线时，后续操作沿用同一状态机。
         let deadline;
         const load = Promise.race([
           modules,
-          new Promise((_, reject) => (deadline = setTimeout(() => reject(new Error('CDN 超时')), 10000))),
+          new Promise((_, reject) => (deadline = setTimeout(() => reject(new Error('三维组件加载超时')), webRuntime ? 25000 : 10000))),
         ]);
         const result = load.then(
           (value) => ({ value }),
@@ -10051,7 +10120,7 @@
           }
           let next = null;
           try {
-            // 初次 CDN 加载若刚好赶上翻页，等书静止后再交接画布，避免途中跳到另一幅构图。
+            // 首次加载若刚好赶上翻页，等书静止后再交接画布，避免途中跳到另一幅构图。
             if (transition?.kind === 'book') {
               await new Promise((resolve) => { transition.onRest = resolve; });
             }

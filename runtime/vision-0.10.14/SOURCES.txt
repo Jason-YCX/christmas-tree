@@ -1,0 +1,12 @@
+MediaPipe Tasks Vision 0.10.14
+Publisher: Google LLC
+Package: https://www.npmjs.com/package/@mediapipe/tasks-vision/v/0.10.14
+Source and license: https://github.com/google-ai-edge/mediapipe/tree/v0.10.14
+The browser module and both WebAssembly builds are unmodified npm package files.
+
+MediaPipe Hand Landmarker, full, float16, model bundle version 1
+Publisher: Google
+Model: https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
+SHA-256: fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1
+Model card: https://storage.googleapis.com/mediapipe-assets/Model%20Card%20Hand%20Tracking%20%28Lite_Full%29%20with%20Fairness%20Oct%202021.pdf
+The model card specifies the Apache License, Version 2.0. See LICENSE.
